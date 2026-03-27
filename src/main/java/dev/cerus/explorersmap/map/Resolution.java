@@ -1,6 +1,7 @@
 package dev.cerus.explorersmap.map;
 
 import com.hypixel.hytale.protocol.packets.worldmap.MapImage;
+import dev.cerus.explorersmap.util.MapImageUtil;
 import java.awt.Image;
 import java.awt.image.BufferedImage;
 
@@ -42,27 +43,17 @@ public interface Resolution {
                 return tile;
             }
 
-            BufferedImage tileImg = new BufferedImage(tile.width, tile.height, BufferedImage.TYPE_INT_ARGB);
-            for (int x = 0; x < tile.width; x++) {
-                for (int z = 0; z < tile.height; z++) {
-                    int color = tile.data[x * tile.width + z];
-                    int r = color >> 24 & 0xFF;
-                    int g = color >> 16 & 0xFF;
-                    int b = color >> 8 & 0xFF;
-                    int a = color >> 0 & 0xFF;
-
-                    tileImg.setRGB(x, z, ((a & 0xFF) << 24) | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | ((b & 0xFF) << 0));
-                }
-            }
+            BufferedImage tileImg = MapImageUtil.toBufferedImage(tile);
             tileImg = rescale(tileImg);
 
-            tile = new MapImage(imageSize, imageSize, new int[imageSize * imageSize]);
+            int[] pixels = new int[imageSize * imageSize];
             for (int x = 0; x < tileImg.getWidth(); x++) {
                 for (int y = 0; y < tileImg.getHeight(); y++) {
                     int rgb = tileImg.getRGB(x, y);
-                    tile.data[x * tile.width + y] = (((rgb >> 16) & 0xFF) & 255) << 24 | (((rgb >> 8) & 0xFF) & 255) << 16 | ((rgb & 0xFF) & 255) << 8 | (((rgb >> 24) & 0xFF) & 255);
+                    pixels[y * imageSize + x] = (((rgb >> 16) & 0xFF) & 255) << 24 | (((rgb >> 8) & 0xFF) & 255) << 16 | ((rgb & 0xFF) & 255) << 8 | (((rgb >> 24) & 0xFF) & 255);
                 }
             }
+            tile = MapImageUtil.buildMapImage(imageSize, imageSize, pixels);
             return tile;
         }
 

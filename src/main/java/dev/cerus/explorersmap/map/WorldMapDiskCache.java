@@ -3,6 +3,7 @@ package dev.cerus.explorersmap.map;
 import com.hypixel.hytale.math.util.ChunkUtil;
 import com.hypixel.hytale.protocol.packets.worldmap.MapImage;
 import com.hypixel.hytale.server.core.universe.world.World;
+import dev.cerus.explorersmap.util.MapImageUtil;
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import java.awt.image.BufferedImage;
@@ -49,26 +50,14 @@ public class WorldMapDiskCache {
     }
 
     public void saveImageToDisk(String world, int chunkX, int chunkZ, float scale, MapImage mapImage) throws IOException {
-        if (mapImage.data == null) {
+        if (mapImage.palette == null) {
             return;
         }
 
         Path path = getImagePath(world, chunkX, chunkZ, scale);
         Files.createDirectories(path.getParent());
 
-        BufferedImage image = new BufferedImage(mapImage.width, mapImage.height, BufferedImage.TYPE_INT_ARGB);
-        for (int x = 0; x < mapImage.width; x++) {
-            for (int z = 0; z < mapImage.height; z++) {
-                int color = mapImage.data[x * mapImage.width + z];
-                int r = color >> 24 & 0xFF;
-                int g = color >> 16 & 0xFF;
-                int b = color >> 8 & 0xFF;
-                int a = color >> 0 & 0xFF;
-
-                image.setRGB(x, z, ((a & 0xFF) << 24) | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | ((b & 0xFF) << 0));
-            }
-        }
-
+        BufferedImage image = MapImageUtil.toBufferedImage(mapImage);
         try (OutputStream os = Files.newOutputStream(path, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE, StandardOpenOption.CREATE)) {
             ImageIO.write(image, "png", os);
         }
@@ -142,14 +131,14 @@ public class WorldMapDiskCache {
             img = ImageIO.read(in);
         }
 
-        MapImage mapImage = new MapImage(img.getWidth(), img.getHeight(), new int[img.getWidth() * img.getHeight()]);
+        int[] pixels = new int[img.getWidth() * img.getHeight()];
         for (int x = 0; x < img.getWidth(); x++) {
             for (int y = 0; y < img.getHeight(); y++) {
                 int rgb = img.getRGB(x, y);
-                mapImage.data[x * mapImage.width + y] = (((rgb >> 16) & 0xFF) & 255) << 24 | (((rgb >> 8) & 0xFF) & 255) << 16 | ((rgb & 0xFF) & 255) << 8 | (((rgb >> 24) & 0xFF) & 255);
+                pixels[y * img.getWidth() + x] = (((rgb >> 16) & 0xFF) & 255) << 24 | (((rgb >> 8) & 0xFF) & 255) << 16 | ((rgb & 0xFF) & 255) << 8 | (((rgb >> 24) & 0xFF) & 255);
             }
         }
-        return mapImage;
+        return MapImageUtil.buildMapImage(img.getWidth(), img.getHeight(), pixels);
     }
 
     private Path getImagePath(String world, int chunkX, int chunkZ, float scale) {
