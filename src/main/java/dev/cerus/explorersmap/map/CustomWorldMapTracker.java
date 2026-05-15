@@ -9,6 +9,7 @@ import com.hypixel.hytale.math.iterator.CircleSpiralIterator;
 import com.hypixel.hytale.math.util.ChunkUtil;
 import com.hypixel.hytale.math.util.MathUtil;
 import com.hypixel.hytale.math.vector.Vector3d;
+import com.hypixel.hytale.protocol.NetworkChannel;
 import com.hypixel.hytale.protocol.Packet;
 import com.hypixel.hytale.protocol.packets.worldmap.ClearWorldMap;
 import com.hypixel.hytale.protocol.packets.worldmap.MapChunk;
@@ -122,6 +123,13 @@ public class CustomWorldMapTracker extends WorldMapTracker {
             return;
         }
 
+        // FIX: Don't proceed if the WorldMap channel isn't ready — sending packets before
+        // the channel is writable causes them to be dropped while chunks get marked loaded,
+        // resulting in a permanently blank map.
+        if (!getPlayer().getPlayerConnection().getChannel(NetworkChannel.WorldMap).isWritable()) {
+            return;
+        }
+
         // FIXED: Instead of calling getTransformComponent() which triggers the Async warning,
         // we use the position pushed into our safe AtomicReference.
         TransformComponent transformComponent = this.transformRef.get();
@@ -174,6 +182,15 @@ public class CustomWorldMapTracker extends WorldMapTracker {
 
         if (worldMapManager.isWorldMapEnabled()) {
             tickWorldMap(world, worldMapSettings, playerChunkX, playerChunkZ, config.getGenerationRate());
+        } else {
+            // FIX: Even when live map generation is disabled, still send previously explored
+            // tiles from disk so the player sees their explored areas.
+            List<MapChunk> toSend = new ArrayList<>();
+            reloadPending(world, worldMapSettings, config.getGenerationRate(), toSend);
+            loadStored(world, worldMapSettings, config.getDiskLoadRate(), toSend);
+            if (!toSend.isEmpty()) {
+                writeUpdatePacket(toSend);
+            }
         }
     }
 
@@ -252,6 +269,10 @@ public class CustomWorldMapTracker extends WorldMapTracker {
     }
 
     private int loadArea(World world, WorldMapSettings worldMapSettings, int playerChunkX, int playerChunkZ, int maxGeneration, List<MapChunk> out) {
+        if (config.getExplorationRadius() <= 0) {
+            return maxGeneration;
+        }
+
         loadedLock.writeLock().lock();
         try {
             this.spiralIterator.init(playerChunkX, playerChunkZ, 0, config.getExplorationRadius());
@@ -275,8 +296,13 @@ public class CustomWorldMapTracker extends WorldMapTracker {
                             });
                         }
 
-                        mapImage = currentResolution.rescale(mapImage);
-                        out.add(new MapChunk(mapChunkX, mapChunkZ, mapImage));
+                        // FIX: Null-check before rescale to avoid NPE; remove from loaded to allow retry
+                        if (mapImage != null) {
+                            mapImage = currentResolution.rescale(mapImage);
+                            out.add(new MapChunk(mapChunkX, mapChunkZ, mapImage));
+                        } else {
+                            loaded.remove(chunkCoordinates);
+                        }
                     }
                 }
             }
