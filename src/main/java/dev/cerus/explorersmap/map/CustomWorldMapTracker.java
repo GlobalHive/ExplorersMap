@@ -10,7 +10,6 @@ import com.hypixel.hytale.math.util.ChunkUtil;
 import com.hypixel.hytale.math.util.MathUtil;
 import com.hypixel.hytale.math.vector.Vector3d;
 import com.hypixel.hytale.protocol.NetworkChannel;
-import com.hypixel.hytale.protocol.Packet;
 import com.hypixel.hytale.protocol.packets.worldmap.ClearWorldMap;
 import com.hypixel.hytale.protocol.packets.worldmap.MapChunk;
 import com.hypixel.hytale.protocol.packets.worldmap.MapImage;
@@ -32,6 +31,7 @@ import dev.cerus.explorersmap.storage.ExploredRegion;
 import it.unimi.dsi.fastutil.longs.LongIterator;
 import it.unimi.dsi.fastutil.longs.LongSet;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
@@ -87,6 +87,8 @@ public class CustomWorldMapTracker extends WorldMapTracker {
 
     private boolean started;
     private boolean transformInitialized;
+    private boolean canCheckWorldMapChannel = true;
+    private boolean channelCheckCompatibilityLogged;
     private List<ExploredRegion> loadFromDisk;
     private ExplorationData explorationData;
     private Resolution currentResolution;
@@ -123,10 +125,9 @@ public class CustomWorldMapTracker extends WorldMapTracker {
             return;
         }
 
-        // FIX: Don't proceed if the WorldMap channel isn't ready — sending packets before
-        // the channel is writable causes them to be dropped while chunks get marked loaded,
-        // resulting in a permanently blank map.
-        if (!getPlayer().getPlayerConnection().getChannel(NetworkChannel.WorldMap).isWritable()) {
+        // Guard this check for API compatibility: some server builds removed
+        // PacketHandler#getChannel(NetworkChannel), which would otherwise crash here.
+        if (!isWorldMapChannelWritable()) {
             return;
         }
 
@@ -471,5 +472,32 @@ public class CustomWorldMapTracker extends WorldMapTracker {
             return INSTANCE_SUFFIX_PATTERN.matcher(name).replaceFirst("");
         }
         return name;
+    }
+
+    private boolean isWorldMapChannelWritable() {
+        if (!canCheckWorldMapChannel) {
+            return true;
+        }
+
+        try {
+            Object playerConnection = getPlayer().getPlayerConnection();
+            Method getChannelMethod = playerConnection.getClass().getMethod("getChannel", NetworkChannel.class);
+            Object channel = getChannelMethod.invoke(playerConnection, NetworkChannel.WorldMap);
+            if (channel == null) {
+                return false;
+            }
+            Method isWritableMethod = channel.getClass().getMethod("isWritable");
+            return Boolean.TRUE.equals(isWritableMethod.invoke(channel));
+        } catch (NoSuchMethodException | NoSuchMethodError e) {
+            canCheckWorldMapChannel = false;
+            if (!channelCheckCompatibilityLogged) {
+                channelCheckCompatibilityLogged = true;
+                LOGGER.atInfo().log("WorldMap channel writable check unavailable on this server API; skipping channel pre-check.");
+            }
+            return true;
+        } catch (Throwable throwable) {
+            LOGGER.atWarning().log("Failed to check WorldMap channel writability", throwable);
+            return true;
+        }
     }
 }
