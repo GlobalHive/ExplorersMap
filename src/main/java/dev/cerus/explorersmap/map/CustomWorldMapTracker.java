@@ -8,7 +8,6 @@ import com.hypixel.hytale.logger.HytaleLogger;
 import com.hypixel.hytale.math.iterator.CircleSpiralIterator;
 import com.hypixel.hytale.math.util.ChunkUtil;
 import com.hypixel.hytale.math.util.MathUtil;
-import com.hypixel.hytale.math.vector.Vector3d;
 import com.hypixel.hytale.protocol.NetworkChannel;
 import com.hypixel.hytale.protocol.packets.worldmap.ClearWorldMap;
 import com.hypixel.hytale.protocol.packets.worldmap.MapChunk;
@@ -86,7 +85,6 @@ public class CustomWorldMapTracker extends WorldMapTracker {
     private final AtomicReference<TransformComponent> transformRef = new AtomicReference<>(null);
 
     private boolean started;
-    private boolean transformInitialized;
     private boolean canCheckWorldMapChannel = true;
     private boolean channelCheckCompatibilityLogged;
     private List<ExploredRegion> loadFromDisk;
@@ -139,18 +137,19 @@ public class CustomWorldMapTracker extends WorldMapTracker {
             return;
         }
 
-        if (!transformInitialized) {
-            try {
-                TRANSFORM_COMPONENT_FIELD.set(this, transformComponent);
-            } catch (IllegalAccessException e) {
-                LOGGER.atSevere().log("Failed to set transformComponent", e);
-            }
-            transformInitialized = true;
+        try {
+            TRANSFORM_COMPONENT_FIELD.set(this, transformComponent);
+        } catch (IllegalAccessException e) {
+            LOGGER.atSevere().log("Failed to set transformComponent", e);
         }
 
-        Vector3d position = transformComponent.getPosition();
-        int playerX = MathUtil.floor(position.getX());
-        int playerZ = MathUtil.floor(position.getZ());
+        Object position = resolvePosition(transformComponent);
+        if (position == null) {
+            return;
+        }
+
+        int playerX = MathUtil.floor(readVectorCoordinate(position, "X"));
+        int playerZ = MathUtil.floor(readVectorCoordinate(position, "Z"));
         int playerChunkX = playerX >> 5;
         int playerChunkZ = playerZ >> 5;
 
@@ -452,10 +451,73 @@ public class CustomWorldMapTracker extends WorldMapTracker {
      */
     public void pushTransform(TransformComponent component) {
         this.transformRef.set(component);
+        try {
+            TRANSFORM_COMPONENT_FIELD.set(this, component);
+        } catch (IllegalAccessException e) {
+            LOGGER.atSevere().log("Failed to set transformComponent", e);
+        }
     }
 
     public boolean hasTransform() {
         return transformRef.get() != null;
+    }
+
+    private Object resolvePosition(TransformComponent transformComponent) {
+        try {
+            Method method = transformComponent.getClass().getMethod("getPosition");
+            return method.invoke(transformComponent);
+        } catch (NoSuchMethodException | NoSuchMethodError ignored) {
+            // Fall through to field lookup.
+        } catch (Throwable throwable) {
+            LOGGER.atWarning().log("Failed to resolve transform position via method", throwable);
+        }
+
+        for (String fieldName : new String[]{"position", "pos"}) {
+            try {
+                Field field = transformComponent.getClass().getDeclaredField(fieldName);
+                field.setAccessible(true);
+                return field.get(transformComponent);
+            } catch (NoSuchFieldException ignored) {
+                // Try the next candidate.
+            } catch (Throwable throwable) {
+                LOGGER.atWarning().log("Failed to resolve transform position via field '%s'", fieldName, throwable);
+            }
+        }
+
+        return null;
+    }
+
+    private double readVectorCoordinate(Object vector, String axis) {
+        for (String methodName : new String[]{"get" + axis, axis.toLowerCase()}) {
+            try {
+                Method method = vector.getClass().getMethod(methodName);
+                Object value = method.invoke(vector);
+                if (value instanceof Number number) {
+                    return number.doubleValue();
+                }
+            } catch (NoSuchMethodException | NoSuchMethodError ignored) {
+                // Try the next candidate.
+            } catch (Throwable throwable) {
+                LOGGER.atWarning().log("Failed to read vector coordinate '%s' via method '%s'", axis, methodName, throwable);
+            }
+        }
+
+        for (String fieldName : new String[]{axis.toLowerCase(), axis.toUpperCase()}) {
+            try {
+                Field field = vector.getClass().getDeclaredField(fieldName);
+                field.setAccessible(true);
+                Object value = field.get(vector);
+                if (value instanceof Number number) {
+                    return number.doubleValue();
+                }
+            } catch (NoSuchFieldException ignored) {
+                // Try the next candidate.
+            } catch (Throwable throwable) {
+                LOGGER.atWarning().log("Failed to read vector coordinate '%s' via field '%s'", axis, fieldName, throwable);
+            }
+        }
+
+        throw new IllegalStateException("Unable to resolve vector coordinate " + axis + " from " + vector.getClass().getName());
     }
 
     private boolean shouldPersist(World world) {
