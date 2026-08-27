@@ -12,6 +12,6 @@
   ],
   "Main": "dev.cerus.explorersmap.ExplorersMapPlugin",
   "DisabledByDefault": false,
-  "ServerVersion": "0.5.0",
+  "ServerVersion": "0.6.0",
   "IncludesAssetPack": true
 }

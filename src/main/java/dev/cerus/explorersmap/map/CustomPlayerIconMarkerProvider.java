@@ -16,8 +16,6 @@ import dev.cerus.explorersmap.ExplorersMapPlugin;
 import java.util.function.Predicate;
 import javax.annotation.Nonnull;
 
-import org.joml.Vector3d;
-
 /**
  * A marker provider implementation that sends player markers with unlimited range
  */
@@ -44,7 +42,6 @@ public class CustomPlayerIconMarkerProvider implements WorldMapManager.MarkerPro
             for (PlayerRef otherPlayer : world.getPlayerRefs()) {
                 if (!otherPlayer.getUuid().equals(player.getUuid())) {
                     Transform otherPlayerTransform = otherPlayer.getTransform();
-                    Vector3d otherPos = otherPlayerTransform.getPosition();
                     if (playerMapFilter == null || !playerMapFilter.test(otherPlayer)) {
                         PlayerMarkerComponent playerMarker = new PlayerMarkerComponent(otherPlayer.getUuid());
                         HeightDeltaIconComponent heightDeltaComponent = new HeightDeltaIconComponent(
@@ -53,7 +50,7 @@ public class CustomPlayerIconMarkerProvider implements WorldMapManager.MarkerPro
                                 playersMapConfig.getIconSwapHeightDelta(),
                                 playersMapConfig.getBelowIcon()
                         );
-                        String markerId = "Player-" + otherPlayer.getUuid();
+                        String markerId = otherPlayer.getUuid().toString();
                         MapMarker marker = new MapMarkerBuilder(markerId, "Player.png", otherPlayerTransform)
                                 .withCustomName(otherPlayer.getUsername())
                                 .withComponent(playerMarker)
