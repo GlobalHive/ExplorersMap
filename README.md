@@ -11,6 +11,12 @@
 2. Put the mod into your mods folder
 3. Enjoy!
 
+### Building
+Requires JDK 25 and Maven. This release targets Hytale Server 0.7.0.
+
+Run `mvn clean verify` to build and check the mod. The installable file is
+`target/ExplorersMap-1.1.0.jar`.
+
 ### Configuration
 The mod can be configured in-game using the command `/explorersmap`. You will need to be op or have the permission `explorersmap.command` to run the command.
 

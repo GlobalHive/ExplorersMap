@@ -1,6 +1,7 @@
 package dev.cerus.explorersmap;
 
 import com.hypixel.hytale.component.Holder;
+import com.hypixel.hytale.component.Ref;
 import com.hypixel.hytale.component.Store;
 import com.hypixel.hytale.component.system.DelayedSystem;
 import com.hypixel.hytale.logger.HytaleLogger;
@@ -10,6 +11,7 @@ import com.hypixel.hytale.server.core.event.events.player.AddPlayerToWorldEvent;
 import com.hypixel.hytale.server.core.event.events.player.PlayerDisconnectEvent;
 import com.hypixel.hytale.server.core.plugin.JavaPlugin;
 import com.hypixel.hytale.server.core.plugin.JavaPluginInit;
+import com.hypixel.hytale.server.core.universe.PlayerRef;
 import com.hypixel.hytale.server.core.universe.world.World;
 import com.hypixel.hytale.server.core.universe.world.WorldMapTracker;
 import com.hypixel.hytale.server.core.universe.world.events.AddWorldEvent;
@@ -18,7 +20,6 @@ import com.hypixel.hytale.server.core.universe.world.storage.EntityStore;
 import com.hypixel.hytale.server.core.universe.world.worldmap.WorldMapManager;
 import com.hypixel.hytale.server.core.universe.world.worldmap.WorldMapSettings;
 import com.hypixel.hytale.server.core.util.Config;
-import com.hypixel.hytale.unsafe.UnsafeUtil;
 import dev.cerus.explorersmap.command.ExplorersMapCommand;
 import dev.cerus.explorersmap.config.ExplorersMapConfig;
 import dev.cerus.explorersmap.map.CustomPlayerIconMarkerProvider;
@@ -35,6 +36,7 @@ public class ExplorersMapPlugin extends JavaPlugin {
 
     private static final HytaleLogger LOGGER = HytaleLogger.forEnclosingClass();
     private static ExplorersMapPlugin instance;
+    private Field worldMapTrackerField;
 
     private final Config<ExplorersMapConfig> config;
     private WorldMapDiskCache worldMapDiskCache;
@@ -50,6 +52,13 @@ public class ExplorersMapPlugin extends JavaPlugin {
 
     @Override
     protected void setup() {
+        try {
+            worldMapTrackerField = Player.class.getDeclaredField("worldMapTracker");
+            worldMapTrackerField.setAccessible(true);
+            CustomWorldMapTracker.validateServerApi();
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Unsupported Hytale world map API; expected server 0.7.0", e);
+        }
         instance = this;
         config.get().validate();
         config.save();
@@ -84,15 +93,20 @@ public class ExplorersMapPlugin extends JavaPlugin {
     private void onPlayerAddToWorld(AddPlayerToWorldEvent event) {
         Holder<EntityStore> holder = event.getHolder();
         Player player = holder.getComponent(Player.getComponentType());
-        if (player == null) return;
+        PlayerRef playerRef = holder.getComponent(PlayerRef.getComponentType());
+        if (player == null || playerRef == null) return;
 
         World world = event.getWorld();
         String sanitizedName = CustomWorldMapTracker.sanitizeWorldName(world);
-        UUID playerUuid = player.getUuid();
+        UUID playerUuid = playerRef.getUuid();
 
         CompletableFuture.runAsync(() -> {
             ExplorationStorage.load(sanitizedName, playerUuid);
         }).thenRunAsync(() -> {
+            Ref<EntityStore> reference = playerRef.getReference();
+            if (reference == null || !reference.isValid() || player.getWorld() != world) {
+                return;
+            }
             WorldMapSettings worldMapSettings = world.getWorldMapManager().getWorldMapSettings();
             UpdateWorldMapSettings settingsPacket = worldMapSettings.getSettingsPacket();
             float minZoom = config.get().getMinZoom();
@@ -102,7 +116,7 @@ public class ExplorersMapPlugin extends JavaPlugin {
                 player.getWorldMapTracker().sendSettings(world);
             }
 
-            injectCustomTracker(player);
+            injectCustomTracker(player, playerRef);
             player.getWorldMapTracker().sendSettings(world);
         }, world).whenComplete((unused, throwable) -> {
             if (throwable != null) {
@@ -111,7 +125,7 @@ public class ExplorersMapPlugin extends JavaPlugin {
         });
     }
 
-    private void injectCustomTracker(Player player) {
+    private void injectCustomTracker(Player player, PlayerRef playerRef) {
         if (player.getWorldMapTracker().getClass() != WorldMapTracker.class) {
             if (player.getWorldMapTracker() instanceof CustomWorldMapTracker custom) {
                 custom.reset();
@@ -121,14 +135,20 @@ public class ExplorersMapPlugin extends JavaPlugin {
             return;
         }
 
+        WorldMapTracker original = player.getWorldMapTracker();
+        CustomWorldMapTracker replacement = new CustomWorldMapTracker(player, playerRef);
         try {
-            Field field = player.getClass().getDeclaredField("worldMapTracker");
-            long off = UnsafeUtil.UNSAFE.objectFieldOffset(field);
-            // Safe here because we are inside world.execute()
-            UnsafeUtil.UNSAFE.putObject(player, off, new CustomWorldMapTracker(player));
-        } catch (NoSuchFieldException e) {
-            LOGGER.atSevere().log("Failed to inject custom tracker", e);
+            replacement.copyFrom(original);
+            replacement.setViewRadiusOverride(original.getViewRadiusOverride());
+            // Player has no tracker setter in 0.7.0. Replace its instance field on the world thread.
+            worldMapTrackerField.set(player, replacement);
+        } catch (IllegalAccessException | RuntimeException e) {
+            replacement.unregisterEvents();
+            LOGGER.atSevere().withCause(e).log("Failed to inject custom tracker");
+            return;
         }
+        original.unregisterEvents();
+        replacement.reset();
     }
 
     private void onPlayerDisconnect(PlayerDisconnectEvent event) {

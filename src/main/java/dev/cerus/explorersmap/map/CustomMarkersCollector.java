@@ -61,6 +61,7 @@ public class CustomMarkersCollector implements MarkersCollector {
 
     @Nullable
     @Override
+    @SuppressWarnings("deprecation") // Required by the 0.7.0 MarkersCollector interface.
     public Predicate<PlayerRef> getPlayerMapFilter() {
         return this.tracker.getPlayerMapFilter();
     }

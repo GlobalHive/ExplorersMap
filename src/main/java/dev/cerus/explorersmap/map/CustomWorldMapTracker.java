@@ -9,6 +9,11 @@ import com.hypixel.hytale.math.iterator.CircleSpiralIterator;
 import com.hypixel.hytale.math.util.ChunkUtil;
 import com.hypixel.hytale.math.util.MathUtil;
 import com.hypixel.hytale.protocol.NetworkChannel;
+import com.hypixel.hytale.protocol.io.ChannelConnection;
+import com.hypixel.hytale.component.Ref;
+import com.hypixel.hytale.server.core.universe.PlayerRef;
+import com.hypixel.hytale.server.core.universe.world.storage.EntityStore;
+import org.joml.Vector3d;
 import com.hypixel.hytale.protocol.packets.worldmap.ClearWorldMap;
 import com.hypixel.hytale.protocol.packets.worldmap.MapChunk;
 import com.hypixel.hytale.protocol.packets.worldmap.MapImage;
@@ -30,7 +35,6 @@ import dev.cerus.explorersmap.storage.ExploredRegion;
 import it.unimi.dsi.fastutil.longs.LongIterator;
 import it.unimi.dsi.fastutil.longs.LongSet;
 import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
@@ -51,27 +55,27 @@ public class CustomWorldMapTracker extends WorldMapTracker {
 
     private static final HytaleLogger LOGGER = HytaleLogger.forEnclosingClass();
     private static final Pattern INSTANCE_SUFFIX_PATTERN = Pattern.compile("-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}");
-    private static final int UNLOAD_RATE = 100;
 
-    private static Field TRANSFORM_COMPONENT_FIELD;
-    private static Field MARKER_TRACKER_FIELD;
-    private static Field PLUGIN_FIELD;
+    private static final Field MARKER_TRACKER_FIELD;
+    private static final Field PLUGIN_FIELD;
 
     static {
         try {
             MARKER_TRACKER_FIELD = WorldMapTracker.class.getDeclaredField("markerTracker");
             MARKER_TRACKER_FIELD.setAccessible(true);
 
-            TRANSFORM_COMPONENT_FIELD = WorldMapTracker.class.getDeclaredField("transformComponent");
-            TRANSFORM_COMPONENT_FIELD.setAccessible(true);
-
             PLUGIN_FIELD = PluginClassLoader.class.getDeclaredField("plugin");
             PLUGIN_FIELD.setAccessible(true);
         } catch (NoSuchFieldException e) {
-            LOGGER.atSevere().log("Failed to find required fields", e);
+            throw new ExceptionInInitializerError(e);
         }
     }
 
+    public static void validateServerApi() {
+        // Initializing this class validates the private hooks before registering the plugin.
+    }
+
+    private final PlayerRef playerRef;
     private ExplorersMapConfig config;
 
     private final ReentrantReadWriteLock loadedLock = new ReentrantReadWriteLock();
@@ -79,30 +83,45 @@ public class CustomWorldMapTracker extends WorldMapTracker {
     private final CircleSpiralIterator spiralIterator = new CircleSpiralIterator();
     private final HLongSet loaded = new HLongOpenHashSet();
     private final HLongSet pendingReloadChunks = new HLongOpenHashSet();
-    private MapMarkerTracker mapMarkerTracker;
+    private final MapMarkerTracker mapMarkerTracker;
 
-    // FIXED: Atomic reference to store position data pushed from the World Thread
-    private final AtomicReference<TransformComponent> transformRef = new AtomicReference<>(null);
+    private record MapSnapshot(World world, TransformComponent transform) {}
+
+    private final AtomicReference<MapSnapshot> transformRef = new AtomicReference<>();
 
     private boolean started;
-    private boolean canCheckWorldMapChannel = true;
-    private boolean channelCheckCompatibilityLogged;
     private List<ExploredRegion> loadFromDisk;
     private ExplorationData explorationData;
     private Resolution currentResolution;
 
-    public CustomWorldMapTracker(Player player) {
+    public CustomWorldMapTracker(Player player, PlayerRef playerRef) {
         super(player);
+        this.playerRef = playerRef;
+        setPlayerUuid(playerRef.getUuid());
         this.config = ExplorersMapPlugin.getInstance().getConfig().get();
         this.currentResolution = config.getResolution();
 
         try {
             this.mapMarkerTracker = (MapMarkerTracker) MARKER_TRACKER_FIELD.get(this);
         } catch (IllegalAccessException e) {
-            LOGGER.atSevere().log("Failed to access mapMarkerTracker", e);
+            unregisterEvents();
+            throw new IllegalStateException("Cannot access the server's map marker tracker", e);
         }
     }
 
+    @Override
+    public void copyFrom(WorldMapTracker original) {
+        super.copyFrom(original);
+        try {
+            // The server's copyFrom only copies sent markers, not the visibility filter.
+            MapMarkerTracker originalMarkers = (MapMarkerTracker) MARKER_TRACKER_FIELD.get(original);
+            mapMarkerTracker.setPlayerMapFilter(originalMarkers.getPlayerMapFilter());
+        } catch (IllegalAccessException e) {
+            throw new IllegalStateException("Cannot preserve the original player marker filter", e);
+        }
+    }
+
+    @Override
     public void tick(float dt) {
         tickLock.writeLock().lock();
         try {
@@ -123,33 +142,17 @@ public class CustomWorldMapTracker extends WorldMapTracker {
             return;
         }
 
-        // Guard this check for API compatibility: some server builds removed
-        // PacketHandler#getChannel(NetworkChannel), which would otherwise crash here.
         if (!isWorldMapChannelWritable()) {
             return;
         }
 
-        // FIXED: Instead of calling getTransformComponent() which triggers the Async warning,
-        // we use the position pushed into our safe AtomicReference.
-        TransformComponent transformComponent = this.transformRef.get();
-        if (transformComponent == null) {
-            // No position yet
+        MapSnapshot snapshot = transformRef.get();
+        if (snapshot == null || snapshot.world() != world) {
             return;
         }
-
-        try {
-            TRANSFORM_COMPONENT_FIELD.set(this, transformComponent);
-        } catch (IllegalAccessException e) {
-            LOGGER.atSevere().log("Failed to set transformComponent", e);
-        }
-
-        Object position = resolvePosition(transformComponent);
-        if (position == null) {
-            return;
-        }
-
-        int playerX = MathUtil.floor(readVectorCoordinate(position, "X"));
-        int playerZ = MathUtil.floor(readVectorCoordinate(position, "Z"));
+        Vector3d position = snapshot.transform().getPosition();
+        int playerX = MathUtil.floor(position.x());
+        int playerZ = MathUtil.floor(position.z());
         int playerChunkX = playerX >> 5;
         int playerChunkZ = playerZ >> 5;
 
@@ -167,7 +170,7 @@ public class CustomWorldMapTracker extends WorldMapTracker {
 
         // Load already explored tiles to send to the player
         if (loadFromDisk == null) {
-            explorationData = ExplorationStorage.getOrLoad(sanitizeWorldName(world), getPlayer().getUuid());
+            explorationData = ExplorationStorage.getOrLoad(sanitizeWorldName(world), playerRef.getUuid());
             if (explorationData != null) {
                 ExplorationData dataToUse = config.isPerPlayerMap()
                         ? explorationData
@@ -247,12 +250,17 @@ public class CustomWorldMapTracker extends WorldMapTracker {
                 // Broadcast to other players
                 List<MapChunk> chunksCopy = List.copyOf(toSend);
                 world.execute(() -> {
-                    world.getPlayers().forEach(player -> {
-                        if (!player.getUuid().equals(getPlayer().getUuid())
-                            && player.getWorldMapTracker() instanceof CustomWorldMapTracker customWorldMapTracker) {
-                            customWorldMapTracker.writeUpdatePacket(chunksCopy);
+                    for (PlayerRef otherPlayerRef : world.getPlayerRefs()) {
+                        Ref<EntityStore> reference = otherPlayerRef.getReference();
+                        if (otherPlayerRef.getUuid().equals(playerRef.getUuid()) || reference == null || !reference.isValid()
+                                || reference.getStore() != world.getEntityStore().getStore()) {
+                            continue;
                         }
-                    });
+                        Player player = reference.getStore().getComponent(reference, Player.getComponentType());
+                        if (player != null && player.getWorldMapTracker() instanceof CustomWorldMapTracker tracker) {
+                            tracker.writeUpdatePacket(chunksCopy);
+                        }
+                    }
                 });
             }
         }
@@ -287,6 +295,10 @@ public class CustomWorldMapTracker extends WorldMapTracker {
                         int mapChunkZ = ChunkUtil.zOfChunkIndex(chunkCoordinates);
 
                         MapImage mapImage = future.getNow(null);
+                        if (mapImage == null) {
+                            loaded.remove(chunkCoordinates);
+                            continue;
+                        }
 
                         if (shouldPersist(world)) {
                             ExplorersMapPlugin.getInstance().getWorldMapDiskCache().saveImageToDiskAsync(world, mapChunkX, mapChunkZ, worldMapSettings.getImageScale(), currentResolution, mapImage).whenComplete((unused, throwable) -> {
@@ -296,13 +308,8 @@ public class CustomWorldMapTracker extends WorldMapTracker {
                             });
                         }
 
-                        // FIX: Null-check before rescale to avoid NPE; remove from loaded to allow retry
-                        if (mapImage != null) {
-                            mapImage = currentResolution.rescale(mapImage);
-                            out.add(new MapChunk(mapChunkX, mapChunkZ, mapImage));
-                        } else {
-                            loaded.remove(chunkCoordinates);
-                        }
+                        mapImage = currentResolution.rescale(mapImage);
+                        out.add(new MapChunk(mapChunkX, mapChunkZ, mapImage));
                     }
                 }
             }
@@ -369,12 +376,16 @@ public class CustomWorldMapTracker extends WorldMapTracker {
                     if (!future.isDone()) {
                         --maxGeneration;
                     } else if (loaded.add(chunkCoordinates)) {
-                        iterator.remove();
                         int mapChunkX = ChunkUtil.xOfChunkIndex(chunkCoordinates);
                         int mapChunkZ = ChunkUtil.zOfChunkIndex(chunkCoordinates);
 
                         MapImage mapImage = future.getNow(null);
+                        if (mapImage == null) {
+                            loaded.remove(chunkCoordinates);
+                            continue;
+                        }
 
+                        iterator.remove();
                         if (shouldPersist(world)) {
                             ExplorersMapPlugin.getInstance().getWorldMapDiskCache().saveImageToDiskAsync(world, mapChunkX, mapChunkZ, worldMapSettings.getImageScale(), currentResolution, mapImage).whenComplete((unused, throwable) -> {
                                 if (throwable != null) {
@@ -398,6 +409,7 @@ public class CustomWorldMapTracker extends WorldMapTracker {
 
     @Override
     public void clearChunks(@Nonnull LongSet chunkIndices) {
+        this.tickLock.writeLock().lock();
         this.loadedLock.writeLock().lock();
         try {
             chunkIndices.forEach((index) -> {
@@ -409,12 +421,13 @@ public class CustomWorldMapTracker extends WorldMapTracker {
             });
         } finally {
             this.loadedLock.writeLock().unlock();
+            this.tickLock.writeLock().unlock();
         }
     }
 
     private void writeUpdatePacket(List<MapChunk> list) {
         UpdateWorldMap packet = new UpdateWorldMap(list.toArray(MapChunk[]::new), null, null);
-        getPlayer().getPlayerConnection().write(packet);
+        playerRef.getPacketHandler().write(packet);
     }
 
     @Override
@@ -427,16 +440,20 @@ public class CustomWorldMapTracker extends WorldMapTracker {
     }
 
     public void reset(boolean unload) {
-        loadedLock.writeLock().lock();
+        // Keep the same lock order as tick(), including resets from the world thread.
         tickLock.writeLock().lock();
+        loadedLock.writeLock().lock();
 
         try {
             if (unload) {
-                getPlayer().getPlayerConnection().write(new ClearWorldMap());
+                playerRef.getPacketHandler().write(new ClearWorldMap());
             }
 
             explorationData = null;
             loaded.clear();
+            pendingReloadChunks.clear();
+            mapMarkerTracker.getSentMarkers().clear();
+            transformRef.set(null);
             loadFromDisk = null;
             config = ExplorersMapPlugin.getInstance().getConfig().get();
             currentResolution = config.getResolution();
@@ -446,78 +463,19 @@ public class CustomWorldMapTracker extends WorldMapTracker {
         }
     }
 
-    /**
-     * Called by MapSyncSystem on the World Thread to safely bridge the data.
-     */
-    public void pushTransform(TransformComponent component) {
-        this.transformRef.set(component);
-        try {
-            TRANSFORM_COMPONENT_FIELD.set(this, component);
-        } catch (IllegalAccessException e) {
-            LOGGER.atSevere().log("Failed to set transformComponent", e);
-        }
+    /** Publishes an independent snapshot; ECS components remain owned by the world thread. */
+    public void pushTransform(World world, TransformComponent component) {
+        transformRef.set(new MapSnapshot(world, component.clone()));
+    }
+
+    @Override
+    public TransformComponent getTransformComponent() {
+        MapSnapshot snapshot = transformRef.get();
+        return snapshot == null ? null : snapshot.transform();
     }
 
     public boolean hasTransform() {
         return transformRef.get() != null;
-    }
-
-    private Object resolvePosition(TransformComponent transformComponent) {
-        try {
-            Method method = transformComponent.getClass().getMethod("getPosition");
-            return method.invoke(transformComponent);
-        } catch (NoSuchMethodException | NoSuchMethodError ignored) {
-            // Fall through to field lookup.
-        } catch (Throwable throwable) {
-            LOGGER.atWarning().log("Failed to resolve transform position via method", throwable);
-        }
-
-        for (String fieldName : new String[]{"position", "pos"}) {
-            try {
-                Field field = transformComponent.getClass().getDeclaredField(fieldName);
-                field.setAccessible(true);
-                return field.get(transformComponent);
-            } catch (NoSuchFieldException ignored) {
-                // Try the next candidate.
-            } catch (Throwable throwable) {
-                LOGGER.atWarning().log("Failed to resolve transform position via field '%s'", fieldName, throwable);
-            }
-        }
-
-        return null;
-    }
-
-    private double readVectorCoordinate(Object vector, String axis) {
-        for (String methodName : new String[]{"get" + axis, axis.toLowerCase()}) {
-            try {
-                Method method = vector.getClass().getMethod(methodName);
-                Object value = method.invoke(vector);
-                if (value instanceof Number number) {
-                    return number.doubleValue();
-                }
-            } catch (NoSuchMethodException | NoSuchMethodError ignored) {
-                // Try the next candidate.
-            } catch (Throwable throwable) {
-                LOGGER.atWarning().log("Failed to read vector coordinate '%s' via method '%s'", axis, methodName, throwable);
-            }
-        }
-
-        for (String fieldName : new String[]{axis.toLowerCase(), axis.toUpperCase()}) {
-            try {
-                Field field = vector.getClass().getDeclaredField(fieldName);
-                field.setAccessible(true);
-                Object value = field.get(vector);
-                if (value instanceof Number number) {
-                    return number.doubleValue();
-                }
-            } catch (NoSuchFieldException ignored) {
-                // Try the next candidate.
-            } catch (Throwable throwable) {
-                LOGGER.atWarning().log("Failed to read vector coordinate '%s' via field '%s'", axis, fieldName, throwable);
-            }
-        }
-
-        throw new IllegalStateException("Unable to resolve vector coordinate " + axis + " from " + vector.getClass().getName());
     }
 
     private boolean shouldPersist(World world) {
@@ -525,7 +483,12 @@ public class CustomWorldMapTracker extends WorldMapTracker {
     }
 
     public boolean isLoaded(int chunkX, int chunkZ) {
-        return loaded.contains(ChunkUtil.indexChunk(chunkX, chunkZ));
+        loadedLock.readLock().lock();
+        try {
+            return loaded.contains(ChunkUtil.indexChunk(chunkX, chunkZ));
+        } finally {
+            loadedLock.readLock().unlock();
+        }
     }
 
     public static String sanitizeWorldName(World world) {
@@ -537,29 +500,7 @@ public class CustomWorldMapTracker extends WorldMapTracker {
     }
 
     private boolean isWorldMapChannelWritable() {
-        if (!canCheckWorldMapChannel) {
-            return true;
-        }
-
-        try {
-            Object playerConnection = getPlayer().getPlayerConnection();
-            Method getChannelMethod = playerConnection.getClass().getMethod("getChannel", NetworkChannel.class);
-            Object channel = getChannelMethod.invoke(playerConnection, NetworkChannel.WorldMap);
-            if (channel == null) {
-                return false;
-            }
-            Method isWritableMethod = channel.getClass().getMethod("isWritable");
-            return Boolean.TRUE.equals(isWritableMethod.invoke(channel));
-        } catch (NoSuchMethodException | NoSuchMethodError e) {
-            canCheckWorldMapChannel = false;
-            if (!channelCheckCompatibilityLogged) {
-                channelCheckCompatibilityLogged = true;
-                LOGGER.atInfo().log("WorldMap channel writable check unavailable on this server API; skipping channel pre-check.");
-            }
-            return true;
-        } catch (Throwable throwable) {
-            LOGGER.atWarning().log("Failed to check WorldMap channel writability", throwable);
-            return true;
-        }
+        ChannelConnection channel = playerRef.getPacketHandler().getChannel(NetworkChannel.WorldMap);
+        return channel != null && channel.isWritable();
     }
 }
