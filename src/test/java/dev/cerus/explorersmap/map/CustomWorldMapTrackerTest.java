@@ -1,5 +1,10 @@
 package dev.cerus.explorersmap.map;
 
+import com.hypixel.hytale.component.AddReason;
+import com.hypixel.hytale.component.CommandBuffer;
+import com.hypixel.hytale.component.ComponentType;
+import com.hypixel.hytale.component.Ref;
+import com.hypixel.hytale.component.Store;
 import com.hypixel.hytale.event.EventBus;
 import com.hypixel.hytale.math.vector.Rotation3f;
 import com.hypixel.hytale.protocol.NetworkChannel;
@@ -8,6 +13,7 @@ import com.hypixel.hytale.protocol.packets.worldmap.ClearWorldMap;
 import com.hypixel.hytale.protocol.packets.worldmap.MapMarker;
 import com.hypixel.hytale.protocol.packets.worldmap.MapChunk;
 import com.hypixel.hytale.protocol.packets.worldmap.MapImage;
+import com.hypixel.hytale.protocol.packets.worldmap.UpdateWorldMapSettings;
 import com.hypixel.hytale.server.core.universe.world.worldmap.WorldMapManager;
 import com.hypixel.hytale.server.core.universe.world.worldmap.WorldMapSettings;
 import com.hypixel.hytale.math.util.ChunkUtil;
@@ -20,6 +26,7 @@ import com.hypixel.hytale.server.core.modules.entity.component.TransformComponen
 import com.hypixel.hytale.server.core.universe.PlayerRef;
 import com.hypixel.hytale.server.core.universe.world.World;
 import com.hypixel.hytale.server.core.universe.world.WorldMapTracker;
+import com.hypixel.hytale.server.core.universe.world.storage.EntityStore;
 import com.hypixel.hytale.server.core.util.Config;
 import dev.cerus.explorersmap.ExplorersMapPlugin;
 import dev.cerus.explorersmap.config.ExplorersMapConfig;
@@ -133,6 +140,73 @@ class CustomWorldMapTrackerTest {
         } finally {
             replacement.unregisterEvents();
             original.unregisterEvents();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void playerEnteringStoreInstallsTrackerEvenBeforePlayerRefIsPublished() throws Exception {
+        WorldMapTracker original = new WorldMapTracker(player);
+        Field playerTracker = field(Player.class, "worldMapTracker");
+        playerTracker.set(player, original);
+        doCallRealMethod().when(player).getWorldMapTracker();
+        field(ExplorersMapPlugin.class, "worldMapTrackerField").set(plugin, playerTracker);
+        doCallRealMethod().when(plugin).initializePlayerMap(any(), any(), any());
+
+        World world = mock(World.class);
+        WorldMapManager manager = mock(WorldMapManager.class);
+        WorldMapSettings settings = mock(WorldMapSettings.class);
+        UpdateWorldMapSettings settingsPacket = new UpdateWorldMapSettings();
+        settingsPacket.minScale = 32;
+        settingsPacket.maxScale = 128;
+        when(world.getWorldMapManager()).thenReturn(manager);
+        when(manager.getWorldMapSettings()).thenReturn(settings);
+        when(settings.getSettingsPacket()).thenReturn(settingsPacket);
+
+        Ref<EntityStore> ref = mock(Ref.class);
+        Store<EntityStore> store = mock(Store.class);
+        CommandBuffer<EntityStore> commands = mock(CommandBuffer.class);
+        EntityStore entityStore = mock(EntityStore.class);
+        when(commands.getExternalData()).thenReturn(entityStore);
+        when(entityStore.getWorld()).thenReturn(world);
+        ComponentType<EntityStore, Player> playerType = mock(ComponentType.class);
+        ComponentType<EntityStore, PlayerRef> playerRefType = mock(ComponentType.class);
+
+        try (MockedStatic<Player> playerStatic = mockStatic(Player.class);
+             MockedStatic<PlayerRef> playerRefStatic = mockStatic(PlayerRef.class)) {
+            playerStatic.when(Player::getComponentType).thenReturn(playerType);
+            playerRefStatic.when(PlayerRef::getComponentType).thenReturn(playerRefType);
+            when(commands.getComponent(ref, playerType)).thenReturn(player);
+            when(commands.getComponent(ref, playerRefType)).thenReturn(playerRef);
+            // This was the early-return condition in the old async join callback.
+            assertNull(playerRef.getReference());
+            assertNull(player.getWorld());
+
+            MapPlayerAddedSystem system = new MapPlayerAddedSystem(plugin);
+            try {
+                system.onEntityAdded(ref, AddReason.LOAD, store, commands);
+                CustomWorldMapTracker replacement = assertInstanceOf(CustomWorldMapTracker.class, player.getWorldMapTracker());
+                assertEquals(8, settingsPacket.minScale);
+                verify(packets, atLeastOnce()).write(any(ClearWorldMap.class));
+                assertTrue(((List<?>) field(WorldMapTracker.class, "eventRegistrations").get(original)).isEmpty());
+                clearInvocations(packets);
+
+                // Entering another world resets the same custom tracker instead of leaving old tiles.
+                ((LongSet) field(CustomWorldMapTracker.class, "loaded").get(replacement)).add(ChunkUtil.indexChunk(2, 3));
+                replacement.pushTransform(world, new TransformComponent());
+                World nextWorld = mock(World.class);
+                when(nextWorld.getWorldMapManager()).thenReturn(manager);
+                when(entityStore.getWorld()).thenReturn(nextWorld);
+                system.onEntityAdded(ref, AddReason.LOAD, store, commands);
+                assertSame(replacement, player.getWorldMapTracker());
+                assertFalse(replacement.isLoaded(2, 3));
+                assertFalse(replacement.hasTransform());
+                verify(packets).write(any(ClearWorldMap.class));
+                verify(nextWorld).execute(any(Runnable.class));
+            } finally {
+                player.getWorldMapTracker().unregisterEvents();
+                original.unregisterEvents();
+            }
         }
     }
 

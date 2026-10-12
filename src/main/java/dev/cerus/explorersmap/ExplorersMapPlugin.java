@@ -1,7 +1,6 @@
 package dev.cerus.explorersmap;
 
 import com.hypixel.hytale.component.Holder;
-import com.hypixel.hytale.component.Ref;
 import com.hypixel.hytale.component.Store;
 import com.hypixel.hytale.component.system.DelayedSystem;
 import com.hypixel.hytale.logger.HytaleLogger;
@@ -24,6 +23,7 @@ import dev.cerus.explorersmap.command.ExplorersMapCommand;
 import dev.cerus.explorersmap.config.ExplorersMapConfig;
 import dev.cerus.explorersmap.map.CustomPlayerIconMarkerProvider;
 import dev.cerus.explorersmap.map.CustomWorldMapTracker;
+import dev.cerus.explorersmap.map.MapPlayerAddedSystem;
 import dev.cerus.explorersmap.map.MapSyncSystem;
 import dev.cerus.explorersmap.map.WorldMapDiskCache;
 import dev.cerus.explorersmap.storage.ExplorationStorage;
@@ -65,6 +65,7 @@ public class ExplorersMapPlugin extends JavaPlugin {
 
         worldMapDiskCache = new WorldMapDiskCache(getDataDirectory().resolve("tiles"));
 
+        getEntityStoreRegistry().registerSystem(new MapPlayerAddedSystem(this));
         getEntityStoreRegistry().registerSystem(new MapSyncSystem());
 
         getEventRegistry().registerGlobal(AddPlayerToWorldEvent.class, this::onPlayerAddToWorld);
@@ -100,29 +101,27 @@ public class ExplorersMapPlugin extends JavaPlugin {
         String sanitizedName = CustomWorldMapTracker.sanitizeWorldName(world);
         UUID playerUuid = playerRef.getUuid();
 
-        CompletableFuture.runAsync(() -> {
-            ExplorationStorage.load(sanitizedName, playerUuid);
-        }).thenRunAsync(() -> {
-            Ref<EntityStore> reference = playerRef.getReference();
-            if (reference == null || !reference.isValid() || player.getWorld() != world) {
-                return;
-            }
-            WorldMapSettings worldMapSettings = world.getWorldMapManager().getWorldMapSettings();
-            UpdateWorldMapSettings settingsPacket = worldMapSettings.getSettingsPacket();
-            float minZoom = config.get().getMinZoom();
+        // This event runs before the client is ready and before the player enters the store.
+        // Only preload here; MapPlayerAddedSystem installs the tracker on the world thread.
+        CompletableFuture.runAsync(() -> ExplorationStorage.load(sanitizedName, playerUuid))
+                .whenComplete((unused, throwable) -> {
+                    if (throwable != null) {
+                        LOGGER.atSevere().withCause(throwable).log("Could not load player exploration data");
+                    }
+                });
+    }
 
-            if (settingsPacket.minScale > minZoom && minZoom < settingsPacket.maxScale) {
-                settingsPacket.minScale = Math.max(2, minZoom);
-                player.getWorldMapTracker().sendSettings(world);
-            }
+    /** Called on the world thread when the player has actually entered the entity store. */
+    public void initializePlayerMap(Player player, PlayerRef playerRef, World world) {
+        WorldMapSettings worldMapSettings = world.getWorldMapManager().getWorldMapSettings();
+        UpdateWorldMapSettings settingsPacket = worldMapSettings.getSettingsPacket();
+        float minZoom = getConfig().get().getMinZoom();
+        if (settingsPacket.minScale > minZoom && minZoom < settingsPacket.maxScale) {
+            settingsPacket.minScale = Math.max(2, minZoom);
+        }
 
-            injectCustomTracker(player, playerRef);
-            player.getWorldMapTracker().sendSettings(world);
-        }, world).whenComplete((unused, throwable) -> {
-            if (throwable != null) {
-                LOGGER.atSevere().withCause(throwable).log("Could not load player");
-            }
-        });
+        injectCustomTracker(player, playerRef);
+        player.getWorldMapTracker().sendSettings(world);
     }
 
     private void injectCustomTracker(Player player, PlayerRef playerRef) {
@@ -149,6 +148,7 @@ public class ExplorersMapPlugin extends JavaPlugin {
         }
         original.unregisterEvents();
         replacement.reset();
+        LOGGER.atInfo().log("Installed exploration map tracker for %s", playerRef.getUsername());
     }
 
     private void onPlayerDisconnect(PlayerDisconnectEvent event) {
